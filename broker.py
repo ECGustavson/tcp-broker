@@ -376,12 +376,13 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
             "SecondsSinceLastRecord": await folder.add_variable(idx, "SecondsSinceLastRecord", -1),
             "LastError":              await folder.add_variable(idx, "LastError",              ""),
         }
-        # Tags Ignition needs to write to
+
         CLIENT_WRITABLE = {"Writable", "HandshakeAgain"}
 
         for tag_name, node in nodes.items():
             if tag_name in CLIENT_WRITABLE:
                 await node.set_writable()
+        _opc_nodes[name] = nodes
 
     return server
 
@@ -444,6 +445,11 @@ def make_tcp_handler(scale: dict):
 
         if expected_ip and client_ip != expected_ip:
             log.warning(f"Rejected connection from {client_ip} (expected {expected_ip})")
+            writer.close()
+            return
+
+        if name not in _opc_nodes:
+            log.error(f"OPC nodes not ready for '{name}' — closing connection, scale will retry")
             writer.close()
             return
 
@@ -946,6 +952,7 @@ async def main():
         }
 
     _opc_server = await setup_opc_server(_config, enabled)
+    _broker_log.info(f"OPC nodes built for: {list(_opc_nodes.keys())}")
     _broker_log.info(f"OPC UA endpoint: {_config['opc']['endpoint']}")
 
     await start_tcp_servers(enabled)
