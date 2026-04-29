@@ -7,6 +7,14 @@
       "port": 10010,
       "enabled": true,
       "description": "Finish scale - EG12984 v3.01 - manual print key"
+    },
+    {
+      "name": "RailScale_01",
+      "program": "rail",
+      "ip": "10.10.10.12",
+      "port": 10011,
+      "enabled": true,
+      "description": "Rail scale testing"
     }
   ],
   "opc": {

@@ -7,7 +7,8 @@ by the "program" field (case-insensitive):
   "finish"  — finish scale, manual print key
   "rail"    — rail scale, automatic peak detection
 
-Dual-broker (Option 4) redundancy ready.
+Designed for multi-instance in Docker containers, with second instance as fallback.
+User software on all scales will need to be updated to utilize TCPC2 for the fallback instance. 
 Config-driven scale naming, per-scale logging, watchdog tags,
 OPC UA Sign & Encrypt (Basic256Sha256), and SSH management console.
 
@@ -31,9 +32,9 @@ Console commands (type 'help' at the > prompt):
     help                         Show this help
 
 "finish" message format (20 fields, CRLF terminated):
-  0:Serial, 1:ScaleID(empty), 2:ScaleName, 3:KillID(0), 4:Lot,
-  5:Gross, 6:Tare, 7:Net, 8:H1Gross(0), 9:H1Net(0),
-  10:H2Gross(0), 11:H2Net(0), 12:Units, 13:Temp, 14:TempUnits,
+  0:Serial, 1:ScaleID, 2:ScaleName(PIT, BENCH, etc), 3:KillID(unused), 4:Lot(not currently used),
+  5:Gross, 6:Tare, 7:Net, 8:H1Gross(unused), 9:H1Net(unused),
+  10:H2Gross(unused), 11:H2Net(unused), 12:Units, 13:Temp, 14:TempUnits,
   15:Printer, 16:Order, 17:Date(YYYYMMDD), 18:Time(HHMMSS),
   19:TransactionID(18 chars: MMDDYY+HHMMSS+000000)
 
@@ -47,7 +48,7 @@ Console commands (type 'help' at the > prompt):
 ACK handshake:
   Format: F#1=OK{TransactionID}{HHmmDDMMyy}  (30 chars + CRLF)
   Ignition writes ACK string to the "Writable" OPC tag per scale folder.
-  Broker polls Writable for ack_timeout_seconds (default 5) after each record.
+  Broker polls Writable for ack_timeout_seconds (default 5 - configured in scales.json) after each record.
   On ACK received: sends to 1280, clears Writable, caches ACK string in memory.
   On ACK timeout: logs warning, 1280 will retry on next connection.
   HandshakeAgain (Bool): Ignition or operator writes True to resend cached ACK
@@ -71,7 +72,7 @@ from asyncua import Server, ua
 CONFIG_PATH = "scales.json"
 
 _runtime: dict     = {}   # { name: { connected, record_count, last_record_time, last_error,
-                           #           last_trans_id, last_ack, config } }
+                            #           last_trans_id, last_ack, config } }
 _opc_nodes: dict   = {}   # { name: { tag_name: Node } }
 _tcp_servers: list = []
 _opc_server: Server | None = None
@@ -81,7 +82,7 @@ _loggers: dict = {}
 _config: dict  = {}
 
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# Config file loading and saving (if modified with console commands) — scales.json is the default but path can be overridden with --config
 
 def load_config(path=CONFIG_PATH) -> dict:
     with open(path) as f:
@@ -93,7 +94,7 @@ def save_config(cfg: dict, path=CONFIG_PATH):
         json.dump(cfg, f, indent=2)
 
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# Logging setup - per scale loggers with rotation, plus console output
 
 def setup_logging(log_cfg: dict):
     log_dir      = log_cfg.get("log_dir",      "logs")
@@ -127,7 +128,7 @@ def setup_logging(log_cfg: dict):
     return make_logger
 
 
-# ── Record parsing ─────────────────────────────────────────────────────────────
+# Record Parsing 
 #
 # Both "finish" and "rail" programs share the same 20-field CSV layout.
 # Field positions are identical between programs; the difference is which
@@ -140,7 +141,7 @@ def setup_logging(log_cfg: dict):
 #
 # The "program" field in scales.json selects which parser is used.
 # Accepted values (case-insensitive): "finish", "rail"
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 # Field index constants — identical layout for both programs
 F_SERIAL     = 0
@@ -265,7 +266,7 @@ def parse_record(raw: str, program: str) -> dict:
         )
 
 
-# ── ACK builder ────────────────────────────────────────────────────────────────
+# ACK string builder - only used for testing using the ack console command
 
 def build_ack(trans_id: str) -> str:
     """
@@ -289,7 +290,7 @@ def build_ack(trans_id: str) -> str:
     return f"F#1={s_rx_data}"                  # full string sent over TCP
 
 
-# ── OPC UA setup ───────────────────────────────────────────────────────────────
+# OPC UA SETUP
 
 async def setup_opc_server(cfg: dict, scales: list) -> Server:
     opc_cfg  = cfg["opc"]
@@ -301,7 +302,7 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
     await server.init()
     server.set_endpoint(opc_cfg["endpoint"])
 
-    # ── Security ───────────────────────────────────────────────────────────────
+    # SECURITY - Not currently used - set up for possible future
     if cert.exists() and key.exists():
         await server.load_certificate(str(cert))
         await server.load_private_key(str(key))
@@ -333,7 +334,7 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
         )
         server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
 
-    # ── Namespace + tag tree ───────────────────────────────────────────────────
+    # Generate folder and tag tree
     idx     = await server.register_namespace(opc_cfg["namespace"])
     objects = server.nodes.objects
 
@@ -341,42 +342,35 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
         name   = scale["name"]
         folder = await objects.add_folder(idx, name)
         nodes  = {
-            # ── Core weight data ───────────────────────────────────────────────
             "GrossWeight":            await folder.add_variable(idx, "GrossWeight",            ""),
             "TareWeight":             await folder.add_variable(idx, "TareWeight",             ""),
             "NetWeight":              await folder.add_variable(idx, "NetWeight",              ""),
-            # ── Half weights (rail: live peak data; finish: always empty) ──────
             "H1Gross":                await folder.add_variable(idx, "H1Gross",                ""),
             "H1Net":                  await folder.add_variable(idx, "H1Net",                  ""),
             "H2Gross":                await folder.add_variable(idx, "H2Gross",                ""),
             "H2Net":                  await folder.add_variable(idx, "H2Net",                  ""),
-            # ── Identification ─────────────────────────────────────────────────
             "Serial":                 await folder.add_variable(idx, "Serial",                 ""),
             "ScaleID":                await folder.add_variable(idx, "ScaleID",                ""),
             "ScaleName":              await folder.add_variable(idx, "ScaleName",              ""),
             "KillID":                 await folder.add_variable(idx, "KillID",                 ""),
             "LotCode":                await folder.add_variable(idx, "LotCode",                ""),
             "WeightUnits":            await folder.add_variable(idx, "WeightUnits",            ""),
-            # ── Temperature (finish: live; rail: always empty) ────────────────
             "Temperature":            await folder.add_variable(idx, "Temperature",            ""),
             "TempUnits":              await folder.add_variable(idx, "TempUnits",              ""),
-            # ── Printer / order (finish: live; rail: always empty) ────────────
             "PrinterNumber":          await folder.add_variable(idx, "PrinterNumber",          ""),
             "OrderNumber":            await folder.add_variable(idx, "OrderNumber",            ""),
-            # ── Timestamp & deduplication key ──────────────────────────────────
             "Timestamp":              await folder.add_variable(idx, "Timestamp",              ""),
             "TransactionID":          await folder.add_variable(idx, "TransactionID",          ""),
-            # ── Ignition UDT interface ─────────────────────────────────────────
+            # Ignition UDT specific tags - sent by end user
             # Message: Ignition watches this tag — fires tag change script on new record
-            # Writable: Ignition writes ACK string here (F#1=OK{TransID}{HHmmDDMMyy})
-            # HandshakeAgain: Ignition/operator writes True to resend cached ACK
-            #                 without re-running the DB insert (e.g. 1280 retries)
+            # Writable: Ignition writes ACK string here (F#1=OK{TransID}{HHmmDDMMyy}). This is called Handshake in the Ignition Rail Scale UDT
+            # HandshakeAgain: Ignition/operator writes True to resend cached ACK - HandshakeAgain needs testing for full functionality proof
             "Message":                await folder.add_variable(idx, "Message",                ""),
             "Writable":               await folder.add_variable(idx, "Writable",               ""),
             "HandshakeAgain":         await folder.add_variable(idx, "HandshakeAgain",         False),
-            # ── Raw record (diagnostics) ───────────────────────────────────────
+            # Raw record (diagnostics)
             "RawRecord":              await folder.add_variable(idx, "RawRecord",              ""),
-            # ── Health / watchdog ──────────────────────────────────────────────
+            # Health monitor
             "Connected":              await folder.add_variable(idx, "Connected",              False),
             "RecordCount":            await folder.add_variable(idx, "RecordCount",            0),
             "SecondsSinceLastRecord": await folder.add_variable(idx, "SecondsSinceLastRecord", -1),
@@ -389,6 +383,7 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
     return server
 
 
+# Helper to build CertificateValidator for OPC UA security — not currently used, but set up for future use if needed.
 async def _build_validator(trusted_dir: Path, rejected_dir: Path):
     from asyncua.crypto.validator import CertificateValidator, CertificateValidatorOptions
     opts = (
@@ -402,7 +397,7 @@ async def _build_validator(trusted_dir: Path, rejected_dir: Path):
     )
 
 
-# ── Watchdog task ──────────────────────────────────────────────────────────────
+# Watchdog task - timer can be modified after testing
 
 async def watchdog_task():
     """Writes SecondsSinceLastRecord for every active scale every 5 s."""
@@ -419,7 +414,7 @@ async def watchdog_task():
                 pass
 
 
-# ── ACK send helper ────────────────────────────────────────────────────────────
+# Ack sender helper - used by TCP handler and console command
 
 async def send_ack(writer: asyncio.StreamWriter, ack_str: str, name: str, log: logging.Logger):
     """Send ACK string to 1280, appending CRLF if not already present."""
@@ -431,7 +426,7 @@ async def send_ack(writer: asyncio.StreamWriter, ack_str: str, name: str, log: l
     log.info(f"ACK sent: {ack_str.strip()}")
 
 
-# ── TCP handler ────────────────────────────────────────────────────────────────
+# TCP Handler - one per scale, created by make_tcp_handler with scale-specific config closure
 
 def make_tcp_handler(scale: dict):
     name         = scale["name"]
@@ -494,8 +489,7 @@ def make_tcp_handler(scale: dict):
                         f"Waiting up to {ack_timeout}s for ACK..."
                     )
 
-                    # ── Poll Writable for Ignition ACK ─────────────────────────
-                    # Ignition tag change script fires on Message, inserts to DB,
+                    # Poll Writable for ACK string from Ignition, which should be written by the tag change script triggered by Message.
                     # then writes F#1=OK{TransID}{HHmmDDMMyy} to Writable.
                     # Console 'ack' command does the same for testing.
                     ack_str = ""
@@ -524,7 +518,7 @@ def make_tcp_handler(scale: dict):
         except asyncio.IncompleteReadError:
             pass
 
-        # ── Check HandshakeAgain on reconnect ──────────────────────────────────
+        # Check HandshakeAgain on reconnect 
         # If the 1280 reconnected because it didn't receive the ACK, and Ignition
         # (or the operator) has written True to HandshakeAgain, resend the cached
         # ACK without re-running the DB insert.
@@ -547,7 +541,7 @@ def make_tcp_handler(scale: dict):
     return handle_client
 
 
-# ── TCP server management ──────────────────────────────────────────────────────
+# TCP server management 
 
 async def start_tcp_servers(scales: list):
     for srv in _tcp_servers:
@@ -608,7 +602,7 @@ async def do_reload():
     return True
 
 
-# ── Console ────────────────────────────────────────────────────────────────────
+# Console Commands
 
 HELP_TEXT = """
 Scale Broker Management Console
@@ -871,7 +865,7 @@ COMMANDS = {
 }
 
 
-# ── Async console loop ─────────────────────────────────────────────────────────
+# Console loop
 
 async def console_loop():
     loop = asyncio.get_event_loop()
@@ -911,7 +905,7 @@ async def console_loop():
             print(f"  Unknown command: '{cmd}'. Type 'help'.")
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# Entry point
 
 async def main():
     global _config, _opc_server, _make_logger, _broker_log

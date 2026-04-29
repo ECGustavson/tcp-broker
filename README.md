@@ -1,8 +1,10 @@
 # Scale Broker
 
-TCP bridge between Rice Lake 1280 indicators and Ignition SCADA via OPC UA. The 1280 connects outbound as a TCP client; the broker listens, parses the CSV record, writes to OPC UA tags, and waits for Ignition to send an ACK back through a writable tag.
+TCP bridge between Rice Lake 1280 indicators and Ignition SCADA via OPC UA. The 1280 connects outbound as a TCP client; the broker listens, parses the CSV record, writes to OPC UA tags, and waits for Ignition to send an ACK back through a writable tag. 
 
 Supports two 1280 user programs — finish scale (manual print key) and rail scale (automatic peak detection). Designed for dual-instance redundancy where both brokers run simultaneously and each 1280 connects to both.
+
+Most 920i's on site are configured as TCP servers. We may want to change this going forward, or can continue using the stock Ignition driver for 920i's, but the hardwired ethernet cards only support one port connection, meaning redundancy can't be used on the 920i's without additional hardware or software. 
 
 ---
 
@@ -10,7 +12,7 @@ Supports two 1280 user programs — finish scale (manual print key) and rail sca
 
 - Python 3.12+
 - `asyncua`
-- `cryptography` (only needed if using OPC UA security)
+- `cryptography` (only needed if using OPC UA security, so not needed for current configuration - only referenced in gen_cert.py)
 
 ```bash
 pip install asyncua cryptography
@@ -45,7 +47,7 @@ python broker.py
     {
       "name": "FinishScale_01",
       "program": "finish",
-      "port": 9001,
+      "port": 10010,
       "ip": "192.168.1.101",
       "enabled": true,
       "description": "Optional label",
@@ -53,7 +55,7 @@ python broker.py
     }
   ],
   "opc": {
-    "endpoint": "opc.tcp://0.0.0.0:4840/broker",
+    "endpoint": "opc.tcp://0.0.0.0:4842/broker",
     "namespace": "http://floweigh/scalebroker",
     "pki_dir": "pki",
     "allow_no_security": true
@@ -72,7 +74,7 @@ python broker.py
 
 **`ack_timeout_seconds`** — how long the broker holds the connection open waiting for Ignition to write the ACK. Default 5.
 
-**`allow_no_security`** — set `true` to run without OPC UA certificates. The recommended approach for most deployments is to rely on VLANs and port lockdown at the network level rather than OPC UA cert-based security. If you do want certs, run `gen_cert.py` first and set this to `false`.
+**`allow_no_security`** — set `true` to run without OPC UA certificates. If certs are needed, run `gen_cert.py` first and set this to `false`.
 
 ---
 
@@ -87,12 +89,12 @@ Each scale gets its own folder named from the `name` field in config. Tags withi
 | `NetWeight` | String | |
 | `H1Gross` | String | Rail only — first half peak gross |
 | `H1Net` | String | Rail only — first half peak net |
-| `H2Gross` | String | Rail only — second half. Empty if skip side pressed. |
-| `H2Net` | String | Rail only — second half. Empty if skip side pressed. |
+| `H2Gross` | String | Rail only — second half. Empty if skip side pressed or whole sow |
+| `H2Net` | String | Rail only — second half. Empty if skip side pressed or whole sow |
 | `Serial` | String | |
-| `ScaleID` | String | Rail: 4=dynamic, 9=static |
-| `ScaleName` | String | Rail: always RAIL. Finish: operator-configured. |
-| `KillID` | String | Rail: sequential head count, resets midnight. Finish: always 0. |
+| `ScaleID` | String | Rail: 4=dynamic, 9=static. Finish: supervisor menu configured|
+| `ScaleName` | String | Rail: always RAIL. Finish: supervisor menu configured |
+| `KillID` | String | Rail: sequential head count, resets midnight. Finish: always ''. |
 | `LotCode` | String | |
 | `WeightUnits` | String | e.g. LB, KG |
 | `Temperature` | String | Finish only |
@@ -114,13 +116,15 @@ Each scale gets its own folder named from the `name` field in config. Tags withi
 
 ## ACK handshake
 
-After writing the OPC tags, the broker holds the TCP connection open and polls `Writable` every 100ms for up to `ack_timeout_seconds`. Ignition's tag change script fires on `Message`, inserts to the database, then writes the ACK string to `Writable`.
+After writing the OPC tags, the broker holds the TCP connection open and polls `Writable` every 100ms for up to `ack_timeout_seconds`. Ignition's tag change script fires on `Message`, inserts to the database, then writes the ACK string to `Writable`. Operation to be confirmed through testing. 
 
 ACK format: `F#1=OK{TransactionID}{HHmmDDMMyy}` + CRLF
 
 The `F#1=` prefix triggers the 1280's `Cmd1Handler`. The remaining 30 characters (`OK` + 18-char TransactionID + 10-char timestamp) are what the 1280 validates. If the length check passes, the 1280 also syncs its RTC to the returned timestamp.
 
-**HandshakeAgain** — if the 1280 didn't receive the ACK and reconnects to retry, write `True` to `HandshakeAgain`. The broker will resend the cached ACK from the previous transaction without Ignition needing to re-run the DB insert.
+`F#2=OKTEST` can be used on the rail scale to simulate limit switch trips
+
+**HandshakeAgain** — if the 1280 didn't receive the ACK and reconnects to retry, write `True` to `HandshakeAgain`. The broker will resend the cached ACK from the previous transaction without Ignition needing to re-run the DB insert. Currenlty unsure of use case, since scale closes connection after a programmable time in the config menu. This may be from 920i server ports, where Ignition always held the connection open unless manually disabled. 
 
 ---
 
@@ -176,11 +180,11 @@ The Ignition UDT watches `Message` for new records and writes ACKs to `Writable`
 
 ## Troubleshooting
 
-**Scale not connecting** — check the broker log for a "Rejected connection" line. The source IP doesn't match the `ip` field. Either update the config or set `ip` to `null` to accept any source.
+**Scale not connecting** — check the broker log for a "Rejected connection" line. The source IP doesn't match the `ip` field. Either update the config or set `ip` to `null` to accept any source, functionally disabling the whitelist
 
-**Parse errors in LastError** — check `RawRecord` for the raw string. Field count must be exactly 20. Rail scale messages have four consecutive commas between Units and Date (`LB,0.0,,,,20260421`).
+**Parse errors in LastError** — check `RawRecord` for the raw string. Field count must be exactly 20 to pass parser check. Rail scale messages have four consecutive commas between Units and Date (`LB,0.0,,,,20260421`).
 
-**ACK timeout warnings** — Ignition didn't write to `Writable` within the timeout window. Check the Ignition tag change script is enabled and the DB connection is healthy. Use `ack <name>` in the console to test the TCP path independently.
+**ACK timeout warnings** — Ignition didn't write to `Writable` within the timeout window. Check the Ignition tag change script is enabled and the DB connection is healthy. Use `ack <name>` in the console to test the TCP path independently. Default time values are hardcoded, but can be updated before deployment after testing, or always include time value in scales.json
 
 **OPC tags show Bad quality** — OPC UA connection is down. If running with `allow_no_security: false`, check `certstatus` and verify the cert exchange with Ignition is complete.
 
