@@ -376,9 +376,12 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
             "SecondsSinceLastRecord": await folder.add_variable(idx, "SecondsSinceLastRecord", -1),
             "LastError":              await folder.add_variable(idx, "LastError",              ""),
         }
-        for node in nodes.values():
-            await node.set_writable()
-        _opc_nodes[name] = nodes
+        # Tags Ignition needs to write to
+        CLIENT_WRITABLE = {"Writable", "HandshakeAgain"}
+
+        for tag_name, node in nodes.items():
+            if tag_name in CLIENT_WRITABLE:
+                await node.set_writable()
 
     return server
 
