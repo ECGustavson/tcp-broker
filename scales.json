@@ -1,0 +1,23 @@
+{
+  "scales": [
+    {
+      "name": "FinishScale_01",
+      "program": "finish",
+      "ip": "10.10.10.11",
+      "port": 10010,
+      "enabled": true,
+      "description": "Finish scale - EG12984 v3.01 - manual print key"
+    }
+  ],
+  "opc": {
+    "endpoint": "opc.tcp://0.0.0.0:4842/broker",
+    "namespace": "http://floweigh/scalebroker",
+    "pki_dir": "pki",
+    "allow_no_security": true
+  },
+  "logging": {
+    "log_dir": "logs",
+    "max_bytes": 5242880,
+    "backup_count": 10
+  }
+}
