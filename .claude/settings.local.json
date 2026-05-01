@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(///floweigh_docs/Floweigh Docs/Customer Files/Customers Programs/Johnsonville Custom Programs/tcp-broker/docker_tcp_broker/**)"
+    ]
+  }
+}

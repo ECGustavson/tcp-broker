@@ -61,6 +61,8 @@ import argparse
 import json
 import logging
 import time
+import os
+import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -85,8 +87,21 @@ _config: dict  = {}
 # Config file loading and saving (if modified with console commands) — scales.json is the default but path can be overridden with --config
 
 def load_config(path=CONFIG_PATH) -> dict:
-    with open(path) as f:
-        return json.load(f)
+    env_config = os.getenv("SCALES_CONFIG")
+    if env_config:
+        try:
+            print("INFO: Loading configuration from SCALES_CONFIG environment variable.")
+            return json.loads(env_config)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Failed to parse SCALES_CONFIG JSON: {e}")
+            sys.exit(1)
+
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+            
+    print("CRITICAL: No configuration found via SCALES_CONFIG or local file.")
+    sys.exit(1)
 
 
 def save_config(cfg: dict, path=CONFIG_PATH):
@@ -300,7 +315,10 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
 
     server = Server()
     await server.init()
-    server.set_endpoint(opc_cfg["endpoint"])
+    
+    # THE CRITICAL FIX: Bind to 0.0.0.0 so the container 'answers the door' on the Balena bridge
+    server.set_endpoint("opc.tcp://0.0.0.0:4842/broker")
+    server.set_server_name("Floweigh Scale Broker")
 
     # SECURITY - Not currently used - set up for possible future
     if cert.exists() and key.exists():
@@ -953,13 +971,19 @@ async def main():
 
     _opc_server = await setup_opc_server(_config, enabled)
     _broker_log.info(f"OPC nodes built for: {list(_opc_nodes.keys())}")
-    _broker_log.info(f"OPC UA endpoint: {_config['opc']['endpoint']}")
+    _broker_log.info(f"OPC UA endpoint: opc.tcp://0.0.0.0:4842/broker")
 
     await start_tcp_servers(enabled)
     asyncio.ensure_future(watchdog_task())
 
     async with _opc_server:
-        await console_loop()
+        # Prevent the EOFError crash when running as a background service in Balena/Docker
+        if sys.stdin.isatty():
+            await console_loop()
+        else:
+            _broker_log.info("Running in background mode (no TTY). Console disabled.")
+            while True:
+                await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
