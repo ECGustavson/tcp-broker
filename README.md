@@ -178,6 +178,78 @@ The Ignition UDT watches `Message` for new records and writes ACKs to `Writable`
 
 ---
 
+## Balena Deployment
+
+The broker is designed to run as a Balena fleet app on a Raspberry Pi 4 (4GB RAM). Ignition and MariaDB should run on a separate x86 machine — the Pi does not have enough RAM to run Ignition alongside the broker.
+
+### docker-compose.yml
+
+```yaml
+version: "2.4"
+
+services:
+  broker:
+    build: .
+    restart: always
+    network_mode: host
+    volumes:
+      - broker-config:/data/config
+      - broker-logs:/data/logs
+
+volumes:
+  broker-config:
+  broker-logs:
+```
+
+`restart: always` is required — Balena does not support `unless-stopped`.
+
+`network_mode: host` puts the broker directly on the host network, which is required for OPC UA and TCP listeners to be reachable without explicit port mapping.
+
+### Console in a container
+
+The interactive console (`>` prompt) is disabled when there is no TTY. To enable it in a Balena/Docker deployment, add to the service in `docker-compose.yml`:
+
+```yaml
+tty: true
+stdin_open: true
+```
+
+Without these, the broker runs in background mode and all interaction is through the Balena logs dashboard.
+
+### Test config (WiFi)
+
+Tested on a Raspberry Pi 4 (4GB RAM) running Balena OS, connected via WiFi. Fleet name: `scale-broker`. OPC UA reachable at `opc.tcp://<device-ip>:4842/broker`.
+
+### Known issues
+
+**`system-connections/ethernet.nmconnection` does not reliably apply via `balena push`.**
+The repo contains `system-connections/ethernet.nmconnection` configured for a static IP of `10.10.10.10/24` on `eth0`. Despite the file being present and not excluded by `.dockerignore` or `.gitignore`, it does not consistently appear in `/mnt/boot/system-connections/` on the device after a push and reboot.
+
+Workaround — write the file directly on the device over SSH:
+
+```bash
+cat > /mnt/boot/system-connections/ethernet.nmconnection << 'EOF'
+[connection]
+id=ethernet
+type=ethernet
+interface-name=eth0
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=10.10.10.10/24
+
+[ipv6]
+method=auto
+EOF
+chmod 600 /mnt/boot/system-connections/ethernet.nmconnection
+nmcli connection reload
+nmcli connection up ethernet
+```
+
+---
+
 ## Troubleshooting
 
 **Scale not connecting** — check the broker log for a "Rejected connection" line. The source IP doesn't match the `ip` field. Either update the config or set `ip` to `null` to accept any source, functionally disabling the whitelist
