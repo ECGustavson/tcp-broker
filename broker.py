@@ -956,13 +956,20 @@ async def main():
     parser.add_argument("--config", default=CONFIG_PATH)
     cli_args = parser.parse_args()
 
+    # 1. Setup logging FIRST so it's available for load_config
+    # Use a dummy config or default values for the logger setup initially
+    _make_logger = setup_logging({}) 
+    _broker_log  = _make_logger("broker")
+
+    # 2. NOW load the actual configuration
     _config      = load_config(cli_args.config)
+    
+    # 3. Re-initialize logger with actual config settings if needed
     _make_logger = setup_logging(_config.get("logging", {}))
     _broker_log  = _make_logger("broker")
 
     _broker_log.info("=" * 60)
     _broker_log.info("Scale Broker starting")
-    _broker_log.info(f"Config: {cli_args.config}")
 
     enabled = [s for s in _config["scales"] if s.get("enabled", True)]
     _broker_log.info(f"Enabled scales: {len(enabled)}")
