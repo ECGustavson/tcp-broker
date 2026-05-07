@@ -91,16 +91,20 @@ def load_config(path=CONFIG_PATH) -> dict:
     if env_config:
         try:
             print("INFO: Loading configuration from SCALES_CONFIG environment variable.")
+            _broker_log.info("Loading configuration from SCALES_CONFIG environment variable.")
             return json.loads(env_config)
         except json.JSONDecodeError as e:
             print(f"ERROR: Failed to parse SCALES_CONFIG JSON: {e}")
+            _broker_log.error(f"Failed to parse SCALES_CONFIG JSON: {e}")
             sys.exit(1)
 
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
+            _broker_log.info(f"Configuration loaded from {path}")
             
     print("CRITICAL: No configuration found via SCALES_CONFIG or local file.")
+    _broker_log.critical("No configuration found via SCALES_CONFIG or local file.")
     sys.exit(1)
 
 
@@ -295,7 +299,7 @@ def build_ack(trans_id: str) -> str:
       "OK"           = 2 chars
       TransactionID  = 18 chars
       HHmmDDMMyy     = 10 chars
-      Total          = 30 chars  ✓
+      Total          = 30 chars  
 
     Full string sent to 1280: "F#1=" + sRxData + CRLF
     """
@@ -352,54 +356,65 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
         )
         server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
 
-    # Generate folder and tag tree
+# Generate folder and tag tree
     idx     = await server.register_namespace(opc_cfg["namespace"])
     objects = server.nodes.objects
 
+    # Tag definitions: (name, default_value)
+    # Single source of truth — easier to maintain than the inline dict.
+    TAG_DEFS = [
+        ("GrossWeight",            ""),
+        ("TareWeight",             ""),
+        ("NetWeight",              ""),
+        ("H1Gross",                ""),
+        ("H1Net",                  ""),
+        ("H2Gross",                ""),
+        ("H2Net",                  ""),
+        ("Serial",                 ""),
+        ("ScaleID",                ""),
+        ("ScaleName",              ""),
+        ("KillID",                 ""),
+        ("LotCode",                ""),
+        ("WeightUnits",            ""),
+        ("Temperature",            ""),
+        ("TempUnits",              ""),
+        ("PrinterNumber",          ""),
+        ("OrderNumber",            ""),
+        ("Timestamp",              ""),
+        ("TransactionID",          ""),
+        ("Message",                ""),
+        ("Writable",               ""),
+        ("HandshakeAgain",         False),
+        ("RawRecord",              ""),
+        ("Connected",              False),
+        ("RecordCount",            0),
+        ("SecondsSinceLastRecord", -1),
+        ("LastError",              ""),
+    ]
+
+    CLIENT_WRITABLE = {"Writable", "HandshakeAgain"}
+
     for scale in scales:
-        name   = scale["name"]
-        folder = await objects.add_folder(idx, name)
-        nodes  = {
-            "GrossWeight":            await folder.add_variable(idx, "GrossWeight",            ""),
-            "TareWeight":             await folder.add_variable(idx, "TareWeight",             ""),
-            "NetWeight":              await folder.add_variable(idx, "NetWeight",              ""),
-            "H1Gross":                await folder.add_variable(idx, "H1Gross",                ""),
-            "H1Net":                  await folder.add_variable(idx, "H1Net",                  ""),
-            "H2Gross":                await folder.add_variable(idx, "H2Gross",                ""),
-            "H2Net":                  await folder.add_variable(idx, "H2Net",                  ""),
-            "Serial":                 await folder.add_variable(idx, "Serial",                 ""),
-            "ScaleID":                await folder.add_variable(idx, "ScaleID",                ""),
-            "ScaleName":              await folder.add_variable(idx, "ScaleName",              ""),
-            "KillID":                 await folder.add_variable(idx, "KillID",                 ""),
-            "LotCode":                await folder.add_variable(idx, "LotCode",                ""),
-            "WeightUnits":            await folder.add_variable(idx, "WeightUnits",            ""),
-            "Temperature":            await folder.add_variable(idx, "Temperature",            ""),
-            "TempUnits":              await folder.add_variable(idx, "TempUnits",              ""),
-            "PrinterNumber":          await folder.add_variable(idx, "PrinterNumber",          ""),
-            "OrderNumber":            await folder.add_variable(idx, "OrderNumber",            ""),
-            "Timestamp":              await folder.add_variable(idx, "Timestamp",              ""),
-            "TransactionID":          await folder.add_variable(idx, "TransactionID",          ""),
-            # Ignition UDT specific tags - sent by end user
-            # Message: Ignition watches this tag — fires tag change script on new record
-            # Writable: Ignition writes ACK string here (F#1=OK{TransID}{HHmmDDMMyy}). This is called Handshake in the Ignition Rail Scale UDT
-            # HandshakeAgain: Ignition/operator writes True to resend cached ACK - HandshakeAgain needs testing for full functionality proof
-            "Message":                await folder.add_variable(idx, "Message",                ""),
-            "Writable":               await folder.add_variable(idx, "Writable",               ""),
-            "HandshakeAgain":         await folder.add_variable(idx, "HandshakeAgain",         False),
-            # Raw record (diagnostics)
-            "RawRecord":              await folder.add_variable(idx, "RawRecord",              ""),
-            # Health monitor
-            "Connected":              await folder.add_variable(idx, "Connected",              False),
-            "RecordCount":            await folder.add_variable(idx, "RecordCount",            0),
-            "SecondsSinceLastRecord": await folder.add_variable(idx, "SecondsSinceLastRecord", -1),
-            "LastError":              await folder.add_variable(idx, "LastError",              ""),
-        }
+        name = scale["name"]
 
-        CLIENT_WRITABLE = {"Writable", "HandshakeAgain"}
+        # Explicit string NodeId for the folder: ns=<idx>;s=<ScaleName>
+        folder = await objects.add_folder(
+            ua.NodeId(name, idx, ua.NodeIdType.String),
+            name,
+        )
 
-        for tag_name, node in nodes.items():
+        nodes = {}
+        for tag_name, default in TAG_DEFS:
+            # Explicit string NodeId for each tag: ns=<idx>;s=<ScaleName>.<TagName>
+            node = await folder.add_variable(
+                ua.NodeId(f"{name}.{tag_name}", idx, ua.NodeIdType.String),
+                tag_name,
+                default,
+            )
             if tag_name in CLIENT_WRITABLE:
                 await node.set_writable()
+            nodes[tag_name] = node
+
         _opc_nodes[name] = nodes
 
     return server
