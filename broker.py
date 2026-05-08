@@ -8,7 +8,7 @@ by the "program" field (case-insensitive):
   "rail"    — rail scale, automatic peak detection
 
 Designed for multi-instance in Docker containers, with second instance as fallback.
-User software on all scales will need to be updated to utilize TCPC2 for the fallback instance. 
+User software on all scales will need to be updated to utilize TCPC2 for the fallback instance.
 Config-driven scale naming, per-scale logging, watchdog tags,
 OPC UA Sign & Encrypt (Basic256Sha256), and SSH management console.
 
@@ -47,12 +47,27 @@ Console commands (type 'help' at the > prompt):
 
 ACK handshake:
   Format: F#1=OK{TransactionID}{HHmmDDMMyy}  (30 chars + CRLF)
-  Ignition writes ACK string to the "Writable" OPC tag per scale folder.
-  Broker polls Writable for ack_timeout_seconds (default 5 - configured in scales.json) after each record.
-  On ACK received: sends to 1280, clears Writable, caches ACK string in memory.
-  On ACK timeout: logs warning, 1280 will retry on next connection.
-  HandshakeAgain (Bool): Ignition or operator writes True to resend cached ACK
-  without re-running the DB insert — used when 1280 reconnects and retries.
+
+  Normal flow:
+    1. 1280 sends record over TCP
+    2. Broker writes Message tag (clears it first to force change event in Ignition)
+    3. Ignition's tag change script on Message fires — does DB insert,
+       builds ACK string, writes it to the Writable tag
+    4. Broker polls Writable, picks up the ACK string, sends to 1280
+
+  Reconnect / retry flow (handled entirely on the Ignition side):
+    1. 1280 didn't receive previous ACK and reconnects, retransmitting the record
+    2. Operator (or Ignition logic) sets HandshakeAgain = True
+    3. Ignition's tag change script on HandshakeAgain fires — same handler
+       as Message change, but should dedupe on TransactionID before re-inserting
+    4. Ignition writes ACK string to Writable
+    5. Broker picks it up and sends to 1280 as normal
+
+  The broker waits indefinitely for Writable to be populated. The only
+  escape is the 1280 closing the TCP socket, which causes readline() to
+  return and the handler to exit cleanly. The 1280 will then reconnect
+  on its retry interval.
+
   Use 'ack <name>' or 'ack last' in the console to test without Ignition.
 """
 
@@ -87,24 +102,25 @@ _config: dict  = {}
 # Config file loading and saving (if modified with console commands) — scales.json is the default but path can be overridden with --config
 
 def load_config(path=CONFIG_PATH) -> dict:
+    """
+    Load configuration from SCALES_CONFIG env var (preferred) or local file.
+    Called before the logger is initialized, so uses print() for diagnostics.
+    """
     env_config = os.getenv("SCALES_CONFIG")
     if env_config:
         try:
             print("INFO: Loading configuration from SCALES_CONFIG environment variable.")
-            _broker_log.info("Loading configuration from SCALES_CONFIG environment variable.")
             return json.loads(env_config)
         except json.JSONDecodeError as e:
             print(f"ERROR: Failed to parse SCALES_CONFIG JSON: {e}")
-            _broker_log.error(f"Failed to parse SCALES_CONFIG JSON: {e}")
             sys.exit(1)
 
     if os.path.exists(path):
+        print(f"INFO: Loading configuration from {path}")
         with open(path) as f:
             return json.load(f)
-            _broker_log.info(f"Configuration loaded from {path}")
-            
+
     print("CRITICAL: No configuration found via SCALES_CONFIG or local file.")
-    _broker_log.critical("No configuration found via SCALES_CONFIG or local file.")
     sys.exit(1)
 
 
@@ -147,7 +163,7 @@ def setup_logging(log_cfg: dict):
     return make_logger
 
 
-# Record Parsing 
+# Record Parsing
 #
 # Both "finish" and "rail" programs share the same 20-field CSV layout.
 # Field positions are identical between programs; the difference is which
@@ -299,7 +315,7 @@ def build_ack(trans_id: str) -> str:
       "OK"           = 2 chars
       TransactionID  = 18 chars
       HHmmDDMMyy     = 10 chars
-      Total          = 30 chars  
+      Total          = 30 chars
 
     Full string sent to 1280: "F#1=" + sRxData + CRLF
     """
@@ -319,7 +335,7 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
 
     server = Server()
     await server.init()
-    
+
     # THE CRITICAL FIX: Bind to 0.0.0.0 so the container 'answers the door' on the Balena bridge
     server.set_endpoint("opc.tcp://0.0.0.0:4842/broker")
     server.set_server_name("Floweigh Scale Broker")
@@ -356,7 +372,7 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
         )
         server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
 
-# Generate folder and tag tree
+    # Generate folder and tag tree
     idx     = await server.register_namespace(opc_cfg["namespace"])
     objects = server.nodes.objects
 
@@ -458,7 +474,7 @@ async def send_ack(writer: asyncio.StreamWriter, ack_str: str, name: str, log: l
     ack_bytes = (ack_str if ack_str.endswith("\r\n") else ack_str + "\r\n").encode("ascii")
     writer.write(ack_bytes)
     await writer.drain()
-    # Cache the ACK for HandshakeAgain retrigger
+    # Cache the ACK for diagnostics and the console 'ack' command
     _runtime[name]["last_ack"] = ack_str.strip()
     log.info(f"ACK sent: {ack_str.strip()}")
 
@@ -469,7 +485,6 @@ def make_tcp_handler(scale: dict):
     name         = scale["name"]
     expected_ip  = scale.get("ip")
     program      = scale.get("program", "finish").lower().strip()
-    ack_timeout  = scale.get("ack_timeout_seconds", 5)
     log          = _make_logger(name)
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -507,15 +522,16 @@ def make_tcp_handler(scale: dict):
                         if key in _opc_nodes[name]:
                             await _opc_nodes[name][key].write_value(val)
 
-                    # Write raw record and Message (Ignition watches Message)
+                    # Write RawRecord, then clear Message and rewrite it.
+                    # The clear+rewrite forces a tag change event in Ignition even
+                    # if this record is byte-identical to the previous one
+                    # (e.g. after Ignition restart with a stale Message value).
                     await _opc_nodes[name]["RawRecord"].write_value(raw.strip())
+                    await _opc_nodes[name]["Message"].write_value("")
+                    await asyncio.sleep(0.05)
                     await _opc_nodes[name]["Message"].write_value(raw.strip())
 
-                    # Clear stale ACK and HandshakeAgain from previous transaction
-                    await _opc_nodes[name]["Writable"].write_value("")
-                    await _opc_nodes[name]["HandshakeAgain"].write_value(False)
-
-                    # Cache TransactionID for HandshakeAgain and console ack command
+                    # Cache TransactionID for the console 'ack' command and diagnostics
                     trans_id = data.get("TransactionID", "")
                     _runtime[name]["last_trans_id"] = trans_id
 
@@ -528,15 +544,16 @@ def make_tcp_handler(scale: dict):
                     log.info(
                         f"Record written | TransID={trans_id} | "
                         f"Net={data.get('NetWeight','')} {data.get('WeightUnits','')} | "
-                        f"Waiting up to {ack_timeout}s for ACK..."
+                        f"Waiting for ACK..."
                     )
 
-                    # Poll Writable for ACK string from Ignition, which should be written by the tag change script triggered by Message.
-                    # then writes F#1=OK{TransID}{HHmmDDMMyy} to Writable.
-                    # Console 'ack' command does the same for testing.
+                    # Poll Writable for ACK string from Ignition.
+                    # No timeout — Ignition's tag change script (on Message OR
+                    # HandshakeAgain) will populate Writable when ready. The
+                    # 1280 closing the socket is the escape hatch: writer
+                    # closes, loop exits, outer readline() returns empty.
                     ack_str = ""
-                    deadline = time.time() + ack_timeout
-                    while time.time() < deadline:
+                    while not writer.is_closing():
                         await asyncio.sleep(0.1)
                         ack_str = await _opc_nodes[name]["Writable"].read_value()
                         if ack_str:
@@ -546,8 +563,9 @@ def make_tcp_handler(scale: dict):
                         await send_ack(writer, ack_str, name, log)
                         await _opc_nodes[name]["Writable"].write_value("")
                     else:
+                        # Only reachable if the writer closed during the poll loop
                         log.warning(
-                            f"ACK timeout ({ack_timeout}s) — Writable not populated. "
+                            f"Connection closed before ACK received. "
                             f"TransID={trans_id} | 1280 will retry on next connection."
                         )
 
@@ -560,30 +578,19 @@ def make_tcp_handler(scale: dict):
         except asyncio.IncompleteReadError:
             pass
 
-        # Check HandshakeAgain on reconnect 
-        # If the 1280 reconnected because it didn't receive the ACK, and Ignition
-        # (or the operator) has written True to HandshakeAgain, resend the cached
-        # ACK without re-running the DB insert.
         finally:
-            try:
-                retrigger = await _opc_nodes[name]["HandshakeAgain"].read_value()
-                cached_ack = _runtime[name].get("last_ack", "")
-                if retrigger and cached_ack and not writer.is_closing():
-                    log.info(f"HandshakeAgain triggered — resending cached ACK: {cached_ack}")
-                    await send_ack(writer, cached_ack, name, log)
-                    await _opc_nodes[name]["HandshakeAgain"].write_value(False)
-            except Exception:
-                pass
-
             log.info("Disconnected")
             _runtime[name]["connected"] = False
-            await _opc_nodes[name]["Connected"].write_value(False)
+            try:
+                await _opc_nodes[name]["Connected"].write_value(False)
+            except Exception:
+                pass
             writer.close()
 
     return handle_client
 
 
-# TCP server management 
+# TCP server management
 
 async def start_tcp_servers(scales: list):
     for srv in _tcp_servers:
@@ -667,6 +674,8 @@ Scale Broker Management Console
 Note: enable / disable / rename take effect after 'reload'.
       OPC UA folder renames require a full broker restart.
       'ack' writes to Writable tag — use for testing without Ignition.
+      Broker waits indefinitely for Ignition to populate Writable;
+      1280 disconnect is the only escape from that wait.
 """
 
 
@@ -956,20 +965,16 @@ async def main():
     parser.add_argument("--config", default=CONFIG_PATH)
     cli_args = parser.parse_args()
 
-    # 1. Setup logging FIRST so it's available for load_config
-    # Use a dummy config or default values for the logger setup initially
-    _make_logger = setup_logging({}) 
-    _broker_log  = _make_logger("broker")
-
-    # 2. NOW load the actual configuration
+    # Load configuration first (uses print() since logger isn't ready yet)
     _config      = load_config(cli_args.config)
-    
-    # 3. Re-initialize logger with actual config settings if needed
+
+    # Initialize logger using settings from the loaded config
     _make_logger = setup_logging(_config.get("logging", {}))
     _broker_log  = _make_logger("broker")
 
     _broker_log.info("=" * 60)
     _broker_log.info("Scale Broker starting")
+    _broker_log.info(f"Config source: {'env var SCALES_CONFIG' if os.getenv('SCALES_CONFIG') else cli_args.config}")
 
     enabled = [s for s in _config["scales"] if s.get("enabled", True)]
     _broker_log.info(f"Enabled scales: {len(enabled)}")
