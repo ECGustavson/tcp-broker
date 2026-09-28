@@ -32,14 +32,14 @@ Console commands (type 'help' at the > prompt):
     help                         Show this help
 
 "finish" message format (20 fields, CRLF terminated):
-  0:Serial, 1:ScaleID, 2:ScaleName(PIT, BENCH, etc), 3:KillID(unused), 4:Lot(not currently used),
+  0:ScaleNo, 1:ScaleID, 2:ScaleType(PIT, BENCH, etc), 3:KillID(unused), 4:Lot/Sequence(not currently used),
   5:Gross, 6:Tare, 7:Net, 8:H1Gross(unused), 9:H1Net(unused),
   10:H2Gross(unused), 11:H2Net(unused), 12:Units, 13:Temp, 14:TempUnits,
   15:Printer, 16:Order, 17:Date(YYYYMMDD), 18:Time(HHMMSS),
   19:TransactionID(18 chars: MMDDYY+HHMMSS+000000)
 
 "rail" message format (20 fields, CRLF terminated) - New String:
-  0:Serial, 1:ScaleID, 2:ScaleName(RAIL), 3:KillID, 4:Lot,
+  0:ScaleNo, 1:ScaleID, 2:ScaleType(RAIL), 3:KillID, 4:Lot/Sequence,
   5:Gross, 6:Tare, 7:Net, 8:H1Gross, 9:H1Net,
   10:H2Gross, 11:H2Net, 12:Units, 13:Temp(0.0), 14:TempUnits(empty),
   15:Printer(empty), 16:Order(empty), 17:Date(YYYYMMDD), 18:Time(HHMMSS),
@@ -171,7 +171,7 @@ def setup_logging(log_cfg: dict):
 #
 #   finish: H1/H2 always empty; Temp/TempUnits/Printer/Order populated
 #   rail:   H1/H2 populated with peak weights; Temp/Printer/Order empty
-#           KillID is sequential (resets midnight); ScaleName always "RAIL"
+#           KillID is sequential (resets midnight); ScaleType always "RAIL"
 #           ScaleID = g_iScale (default 4, dynamic) or 9 (static scale)
 #
 # The "program" field in scales.json selects which parser is used.
@@ -179,11 +179,11 @@ def setup_logging(log_cfg: dict):
 
 
 # Field index constants — identical layout for both programs
-F_SERIAL     = 0
+F_SCALENO    = 0
 F_SCALE_ID   = 1
 F_SCALE_NAME = 2
 F_KILL_ID    = 3
-F_LOT        = 4
+F_SEQUENCE   = 4
 F_GROSS      = 5
 F_TARE       = 6
 F_NET        = 7
@@ -219,11 +219,11 @@ def parse_record_finish(fields: list[str]) -> dict:
         "H1Net":         "",
         "H2Gross":       "",
         "H2Net":         "",
-        "Serial":        fields[F_SERIAL].strip(),
+        "ScaleNo":       fields[F_SCALENO].strip(),
         "ScaleID":       fields[F_SCALE_ID].strip(),
-        "ScaleName":     fields[F_SCALE_NAME].strip(),   # HEADMEAT / PIT / BENCHTOP / custom
+        "ScaleType":     fields[F_SCALE_NAME].strip(),   # HEADMEAT / PIT / BENCHTOP / custom
         "KillID":        fields[F_KILL_ID].strip(),      # always "0"
-        "LotCode":       fields[F_LOT].strip(),
+        "Sequence":      fields[F_SEQUENCE].strip(),
         "WeightUnits":   fields[F_UNITS].strip().upper(),
         "Temperature":   fields[F_TEMP].strip(),
         "TempUnits":     fields[F_TEMP_UNITS].strip(),   # "F" or "C"
@@ -252,11 +252,11 @@ def parse_record_rail(fields: list[str]) -> dict:
         "H1Net":         fields[F_H1_NET].strip(),
         "H2Gross":       fields[F_H2_GROSS].strip(),
         "H2Net":         fields[F_H2_NET].strip(),
-        "Serial":        fields[F_SERIAL].strip(),
+        "ScaleNo":       fields[F_SCALENO].strip(),
         "ScaleID":       fields[F_SCALE_ID].strip(),     # 4=dynamic, 9=static
-        "ScaleName":     fields[F_SCALE_NAME].strip(),   # always "RAIL"
+        "ScaleType":     fields[F_SCALE_NAME].strip(),   # always "RAIL"
         "KillID":        fields[F_KILL_ID].strip(),
-        "LotCode":       fields[F_LOT].strip(),
+        "Sequence":      fields[F_SEQUENCE].strip(),
         "WeightUnits":   fields[F_UNITS].strip().upper(),
         "Temperature":   "",
         "TempUnits":     "",
@@ -386,11 +386,11 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
         ("H1Net",                  ""),
         ("H2Gross",                ""),
         ("H2Net",                  ""),
-        ("Serial",                 ""),
+        ("ScaleNo",                ""),
         ("ScaleID",                ""),
-        ("ScaleName",              ""),
+        ("ScaleType",              ""),
         ("KillID",                 ""),
-        ("LotCode",                ""),
+        ("Sequence",               ""),
         ("WeightUnits",            ""),
         ("Temperature",            ""),
         ("TempUnits",              ""),
@@ -539,6 +539,7 @@ def make_tcp_handler(scale: dict):
                     _runtime[name]["record_count"]     = count
                     _runtime[name]["last_record_time"] = time.time()
                     _runtime[name]["last_error"]       = ""
+                    await _opc_nodes[name]["LastError"].write_value("") 
                     await _opc_nodes[name]["RecordCount"].write_value(count)
 
                     log.info(
